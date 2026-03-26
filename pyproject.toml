@@ -1,0 +1,42 @@
+[tool.poetry]
+name = "ot-visibility-model"
+version = "0.1.0"
+description = "Monte Carlo simulation model testing OT asset inventory vs. checkpoint-only security strategies across 10 competing hypotheses."
+authors = ["Thomas Jones <thomas@thehipsterciso.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+networkx = "^3.2"
+numpy = "^1.26"
+pandas = "^2.1"
+matplotlib = "^3.8"
+seaborn = "^0.13"
+scipy = "^1.11"
+pydantic = "^2.5"
+rich = "^13.7"
+click = "^8.1"
+tqdm = "^4.66"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4"
+pytest-cov = "^4.1"
+ruff = "^0.1"
+black = "^23.0"
+
+[tool.poetry.scripts]
+ot-model = "src.cli:cli"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src --cov-report=term-missing"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
