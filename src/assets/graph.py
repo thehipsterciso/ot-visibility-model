@@ -258,6 +258,28 @@ class MeridianGraph:
         )
         return inventoried / len(ot_nodes)
 
+    def criticality_weighted_completeness(self) -> float:
+        """
+        Weighted inventory completeness where each OT asset's contribution is
+        proportional to its criticality score. A high-criticality asset that is
+        uninventoried degrades this metric more than a low-criticality sensor.
+
+        This is the operationally relevant completeness measure — a site with
+        100% SENSOR_RTU inventory but 0% SAFETY_SYSTEM inventory is not well-covered.
+        """
+        ot_nodes = [(nid, d) for nid, d in self.graph.nodes(data=True) if d.get("is_ot")]
+        if not ot_nodes:
+            return 0.0
+        total_weight = sum(d.get("criticality", 0.5) for _, d in ot_nodes)
+        if total_weight == 0:
+            return 0.0
+        inventoried_weight = sum(
+            d.get("criticality", 0.5)
+            for _, d in ot_nodes
+            if d.get("is_inventoried", False)
+        )
+        return inventoried_weight / total_weight
+
     def summary(self) -> dict:
         ot_count = sum(1 for _, d in self.graph.nodes(data=True) if d.get("is_ot"))
         it_count = sum(1 for _, d in self.graph.nodes(data=True) if d.get("is_it"))
@@ -271,6 +293,7 @@ class MeridianGraph:
             "ot_assets": ot_count,
             "it_assets": it_count,
             "inventory_completeness": round(self.inventory_completeness_actual(), 3),
+            "criticality_weighted_completeness": round(self.criticality_weighted_completeness(), 3),
             "direct_external_access_points": direct_access,
             "crown_jewels": len(self.get_crown_jewels()),
             "uninventoried_ot": len(self.get_uninventoried_nodes()),

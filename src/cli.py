@@ -61,6 +61,11 @@ def run_all(iterations: int, output_dir: str):
     with console.status("[cyan]S2: Inventory-first..."):
         s2 = SimulationEngine(inventory_completeness=1.00, control_strategy=ControlStrategy.CHECKPOINT_ONLY,
             iterations=iterations, scenario_id="S2").run()
+    # S1_inv: same inventory as S1 (40%) but with INVENTORY_INFORMED strategy
+    # Isolates strategy effect from inventory effect for fair H1 comparison
+    with console.status("[cyan]S1_inv: Inventory-informed at 40% inventory (H1 same-inventory comparison)..."):
+        s1_inv = SimulationEngine(inventory_completeness=0.40, control_strategy=ControlStrategy.INVENTORY_INFORMED,
+            iterations=iterations, scenario_id="S1_inv").run()
     with console.status("[cyan]S5: Insider/vendor only..."):
         s5 = SimulationEngine(inventory_completeness=0.40, control_strategy=ControlStrategy.CHECKPOINT_ONLY,
             threat_mix={ThreatActor.TA3_INSIDER_VENDOR: 1.0}, iterations=iterations, scenario_id="S5").run()
@@ -71,11 +76,21 @@ def run_all(iterations: int, output_dir: str):
     sweep_levels = [0.0, 0.25, 0.40, 0.60, 0.75, 0.90, 1.0]
     sweep_results = []
     for level in sweep_levels:
-        with console.status(f"[cyan]Sweep: {level:.0%} inventory..."):
+        with console.status(f"[cyan]Sweep (checkpoint-only): {level:.0%} inventory..."):
             result = SimulationEngine(inventory_completeness=level,
                 control_strategy=ControlStrategy.CHECKPOINT_ONLY,
                 iterations=iterations, scenario_id=f"S4_{int(level*100)}").run()
             sweep_results.append(result)
+
+    # Optimized sweep: same levels with CHECKPOINT_OPTIMIZED — used by H2/H3/H7/H8
+    # to demonstrate that the inventory→outcome correlation holds across strategies
+    optimized_sweep_results = []
+    for level in sweep_levels:
+        with console.status(f"[cyan]Sweep (checkpoint-optimized): {level:.0%} inventory..."):
+            result = SimulationEngine(inventory_completeness=level,
+                control_strategy=ControlStrategy.CHECKPOINT_OPTIMIZED,
+                iterations=iterations, scenario_id=f"S4opt_{int(level*100)}").run()
+            optimized_sweep_results.append(result)
 
     # Build baseline graph for H6
     baseline_graph = MeridianGraph(inventory_completeness=0.40).build()
@@ -83,14 +98,30 @@ def run_all(iterations: int, output_dir: str):
     console.print("\n[bold cyan]Evaluating hypotheses...[/bold cyan]\n")
 
     results_list = [
-        H1BortHypothesis().evaluate(checkpoint_results=s1, inventory_results=s2),
-        H2FoundationHypothesis().evaluate(sweep_results=sweep_results),
-        H3ActionabilityGapHypothesis().evaluate(sweep_results=sweep_results),
+        H1BortHypothesis().evaluate(
+            checkpoint_results=s1, inventory_results=s2,
+            checkpoint_same_inv_results=s1,
+            inventory_same_inv_results=s1_inv,
+        ),
+        H2FoundationHypothesis().evaluate(
+            sweep_results=sweep_results,
+            optimized_sweep_results=optimized_sweep_results,
+        ),
+        H3ActionabilityGapHypothesis().evaluate(
+            sweep_results=sweep_results,
+            optimized_sweep_results=optimized_sweep_results,
+        ),
         H4BlastRadiusHypothesis().evaluate(sweep_results=sweep_results),
         H5InsiderHypothesis().evaluate(checkpoint_ta3_results=s5, inventory_ta3_results=h5_inv),
         H6SegmentationQualityHypothesis().evaluate(sweep_results=sweep_results, graph=baseline_graph),
-        H7ResponseInflectionHypothesis().evaluate(sweep_results=sweep_results),
-        H8RiskQuantificationHypothesis().evaluate(sweep_results=sweep_results),
+        H7ResponseInflectionHypothesis().evaluate(
+            sweep_results=sweep_results,
+            optimized_sweep_results=optimized_sweep_results,
+        ),
+        H8RiskQuantificationHypothesis().evaluate(
+            sweep_results=sweep_results,
+            optimized_sweep_results=optimized_sweep_results,
+        ),
         H9ComplianceExposureHypothesis().evaluate(sweep_results=sweep_results),
         H10CostParityHypothesis().evaluate(baseline_results=s0, full_inv_results=s2),
     ]
@@ -119,8 +150,9 @@ def run_all(iterations: int, output_dir: str):
     return {
         "results": results_list,
         "scenarios": {
-            "s0": s0, "s1": s1, "s2": s2, "s5": s5, "h5_inv": h5_inv,
-            "sweep": sweep_results, "baseline_graph": baseline_graph,
+            "s0": s0, "s1": s1, "s2": s2, "s1_inv": s1_inv, "s5": s5, "h5_inv": h5_inv,
+            "sweep": sweep_results, "optimized_sweep": optimized_sweep_results,
+            "baseline_graph": baseline_graph,
         },
     }
 
@@ -158,6 +190,9 @@ def report(iterations: int, output: str):
     with console.status("[cyan]S2: Inventory-first..."):
         s2 = SimulationEngine(inventory_completeness=1.00, control_strategy=ControlStrategy.CHECKPOINT_ONLY,
             iterations=iterations, scenario_id="S2").run()
+    with console.status("[cyan]S1_inv: Inventory-informed at 40% (H1 same-inventory comparison)..."):
+        s1_inv = SimulationEngine(inventory_completeness=0.40, control_strategy=ControlStrategy.INVENTORY_INFORMED,
+            iterations=iterations, scenario_id="S1_inv").run()
     with console.status("[cyan]S5: Insider/vendor only..."):
         s5 = SimulationEngine(inventory_completeness=0.40, control_strategy=ControlStrategy.CHECKPOINT_ONLY,
             threat_mix={ThreatActor.TA3_INSIDER_VENDOR: 1.0}, iterations=iterations, scenario_id="S5").run()
@@ -168,24 +203,40 @@ def report(iterations: int, output: str):
     sweep_levels = [0.0, 0.25, 0.40, 0.60, 0.75, 0.90, 1.0]
     sweep_results = []
     for level in sweep_levels:
-        with console.status(f"[cyan]Sweep: {level:.0%} inventory..."):
+        with console.status(f"[cyan]Sweep (checkpoint-only): {level:.0%} inventory..."):
             r = SimulationEngine(inventory_completeness=level,
                 control_strategy=ControlStrategy.CHECKPOINT_ONLY,
                 iterations=iterations, scenario_id=f"S4_{int(level*100)}").run()
             sweep_results.append(r)
 
+    optimized_sweep_results = []
+    for level in sweep_levels:
+        with console.status(f"[cyan]Sweep (checkpoint-optimized): {level:.0%} inventory..."):
+            r = SimulationEngine(inventory_completeness=level,
+                control_strategy=ControlStrategy.CHECKPOINT_OPTIMIZED,
+                iterations=iterations, scenario_id=f"S4opt_{int(level*100)}").run()
+            optimized_sweep_results.append(r)
+
     baseline_graph = MeridianGraph(inventory_completeness=0.40).build()
 
     # --- Evaluate hypotheses ---
     console.print("[bold cyan]Evaluating hypotheses...[/bold cyan]")
-    h1 = H1BortHypothesis().evaluate(checkpoint_results=s1, inventory_results=s2)
-    h2 = H2FoundationHypothesis().evaluate(sweep_results=sweep_results)
-    h3 = H3ActionabilityGapHypothesis().evaluate(sweep_results=sweep_results)
+    h1 = H1BortHypothesis().evaluate(
+        checkpoint_results=s1, inventory_results=s2,
+        checkpoint_same_inv_results=s1,
+        inventory_same_inv_results=s1_inv,
+    )
+    h2 = H2FoundationHypothesis().evaluate(
+        sweep_results=sweep_results, optimized_sweep_results=optimized_sweep_results)
+    h3 = H3ActionabilityGapHypothesis().evaluate(
+        sweep_results=sweep_results, optimized_sweep_results=optimized_sweep_results)
     h4 = H4BlastRadiusHypothesis().evaluate(sweep_results=sweep_results)
     h5 = H5InsiderHypothesis().evaluate(checkpoint_ta3_results=s5, inventory_ta3_results=h5_inv)
     h6 = H6SegmentationQualityHypothesis().evaluate(sweep_results=sweep_results, graph=baseline_graph)
-    h7 = H7ResponseInflectionHypothesis().evaluate(sweep_results=sweep_results)
-    h8 = H8RiskQuantificationHypothesis().evaluate(sweep_results=sweep_results)
+    h7 = H7ResponseInflectionHypothesis().evaluate(
+        sweep_results=sweep_results, optimized_sweep_results=optimized_sweep_results)
+    h8 = H8RiskQuantificationHypothesis().evaluate(
+        sweep_results=sweep_results, optimized_sweep_results=optimized_sweep_results)
     h9 = H9ComplianceExposureHypothesis().evaluate(sweep_results=sweep_results)
     h10 = H10CostParityHypothesis().evaluate(baseline_results=s0, full_inv_results=s2)
 
@@ -210,6 +261,68 @@ def report(iterations: int, output: str):
     console.print(f"[bold cyan]Writing report to {output_path}...[/bold cyan]")
     generate_html_report(results, charts, output_path)
     console.print(f"\n[green]Report written to {output_path}[/green]")
+
+
+@cli.command()
+@click.option("--iterations", "-n", default=2000, help="Monte Carlo iterations per perturbation scenario")
+@click.option("--output", "-o", default="outputs/sensitivity_report.json", help="Output JSON path")
+def sensitivity(iterations: int, output: str):
+    """Run parameter sensitivity analysis across ±20%/±40% perturbations on key model parameters."""
+    from src.sensitivity import ParameterSensitivityAnalyzer, PERTURBATION_LEVELS
+
+    output_path = Path(output)
+    output_path.parent.mkdir(exist_ok=True)
+
+    console.print(f"\n[bold cyan]OT Visibility Model — Parameter Sensitivity Analysis[/bold cyan]")
+    console.print(f"[dim]{len(PERTURBATION_LEVELS)} perturbation levels × {iterations:,} iterations each[/dim]\n")
+
+    analyzer = ParameterSensitivityAnalyzer(iterations=iterations)
+
+    def progress(label: str):
+        console.print(f"  [cyan]Running:[/cyan] {label}")
+
+    report_data = analyzer.run(progress_callback=progress)
+
+    table = Table(title="Sensitivity Analysis — Hypothesis Stability", show_lines=True)
+    table.add_column("ID", style="cyan", width=4)
+    table.add_column("Baseline", style="bold", width=14)
+    table.add_column("Stable?", style="bold", width=8)
+    table.add_column("Instability Count", style="white", width=18)
+    table.add_column("Primary Value CV", style="white", width=18)
+    for r in report_data.results:
+        stable = r.is_stable()
+        color = "green" if stable else "yellow"
+        table.add_row(
+            r.hypothesis_id,
+            r.baseline_verdict,
+            f"[{color}]{'YES' if stable else 'NO'}[/{color}]",
+            str(r.instability_count()),
+            f"{r.primary_value_cv():.3f}",
+        )
+    console.print(table)
+
+    stable = report_data.stable_verdicts()
+    unstable = report_data.unstable_verdicts()
+    console.print(f"\n[green]Stable verdicts: {len(stable)}/10[/green]")
+    if unstable:
+        console.print(f"[yellow]Parameter-sensitive verdicts: {', '.join(r.hypothesis_id for r in unstable)}[/yellow]")
+
+    output_data = {
+        "summary": report_data.summary_table(),
+        "details": {
+            r.hypothesis_id: {
+                "baseline_verdict": r.baseline_verdict,
+                "is_stable": r.is_stable(),
+                "instability_count": r.instability_count(),
+                "primary_value_cv": r.primary_value_cv(),
+                "verdicts_by_perturbation": r.verdicts_by_perturbation,
+            }
+            for r in report_data.results
+        },
+    }
+    with open(output_path, "w") as f:
+        json.dump(output_data, f, indent=2, default=str)
+    console.print(f"\n[green]Sensitivity report saved to {output_path}[/green]")
 
 
 if __name__ == "__main__":
