@@ -9,9 +9,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 
+import networkx as nx
 import numpy as np
 from scipy import stats
 
+from src.assets.graph import MeridianGraph
 from src.constants import (
     ControlStrategy, HypothesisVerdict, Meridian, SimConfig, ThreatActor
 )
@@ -148,9 +150,12 @@ class H4BlastRadiusHypothesis(BaseHypothesis):
             mean_attacker_advantages[0] > mean_attacker_advantages[-1] * 2.5)
         advantage_at_40pct = next((r.mean_attacker_advantage() for r in sweep_results if abs(r.inventory_completeness - 0.40) < 0.05), None)
         advantage_at_100pct = next((r.mean_attacker_advantage() for r in sweep_results if abs(r.inventory_completeness - 1.0) < 0.05), None)
+        # Fallback to lowest-completeness result if 40% not in sweep
+        baseline_advantage = advantage_at_40pct or mean_attacker_advantages[0]
+        baseline_completeness = 0.40 if advantage_at_40pct is not None else completeness_levels[0]
         if super_linear:
             verdict = HypothesisVerdict.SUPPORTED
-            finding = (f"Super-linear attacker advantage: quadratic R²={r2_quad:.3f} vs linear R²={r2_linear:.3f}. At 40% inventory, attacker sees {advantage_at_40pct:.1f}x more of the OT blast radius than the defender.")
+            finding = (f"Super-linear attacker advantage: quadratic R²={r2_quad:.3f} vs linear R²={r2_linear:.3f}. At {baseline_completeness:.0%} inventory, attacker sees {baseline_advantage:.1f}x more of the OT blast radius than the defender.")
         elif r2_quad > r2_linear:
             verdict = HypothesisVerdict.INCONCLUSIVE
             finding = f"Some evidence of super-linearity but not conclusive. Quadratic R²={r2_quad:.3f} vs linear R²={r2_linear:.3f}."
@@ -160,7 +165,7 @@ class H4BlastRadiusHypothesis(BaseHypothesis):
         return HypothesisResult(
             hypothesis_id=self.hypothesis_id, title=self.title, verdict=verdict,
             primary_metric="Attacker advantage ratio at Meridian baseline (40% OT inventory)",
-            primary_value=advantage_at_40pct or 0.0, key_finding=finding,
+            primary_value=baseline_advantage, key_finding=finding,
             supporting_metrics={"completeness_levels": completeness_levels,
                 "mean_attacker_advantages": mean_attacker_advantages,
                 "r2_linear": r2_linear, "r2_quadratic": r2_quad,
@@ -222,9 +227,16 @@ class H7ResponseInflectionHypothesis(BaseHypothesis):
         x = np.array(completeness_levels)
         y_acc = np.array(response_accuracies)
         if len(x) >= 4:
-            poly_coeffs = np.polyfit(x, y_acc, 3)
-            a, b = poly_coeffs[0], poly_coeffs[1]
-            inflection_x = float(np.clip(-b / (3 * a) if a != 0 else 0.5, 0, 1))
+            # Fit a degree-4 polynomial and find the inflection as the point of
+            # maximum first derivative (most rapid change) — more robust than the
+            # cubic inflection formula, which fails when the cubic opens upward.
+            degree = min(4, len(x) - 1)
+            poly_coeffs = np.polyfit(x, y_acc, degree)
+            xs_dense = np.linspace(float(x.min()), float(x.max()), 500)
+            y_dense = np.polyval(poly_coeffs, xs_dense)
+            dy = np.gradient(y_dense, xs_dense)
+            inflection_x = float(xs_dense[int(np.argmax(dy))])
+            inflection_x = float(np.clip(inflection_x, 0, 1))
         else:
             inflection_x = 0.65
         linear_pred = np.polyval(np.polyfit(x, y_acc, 1), x)
@@ -283,4 +295,339 @@ class H10CostParityHypothesis(BaseHypothesis):
                 "program_cost": self.INVENTORY_PROGRAM_COST, "net_roi": roi,
                 "payback_years": payback_years, "inversion_multiplier": inversion_multiplier},
             falsification_condition=self.falsification_condition, falsification_met=not program_justified,
+        )
+
+
+class H3ActionabilityGapHypothesis(BaseHypothesis):
+    hypothesis_id = "H3"
+    title = "Detection lead time has independent value — early visibility reduces impact regardless of response maturity"
+    falsification_condition = "No significant negative correlation between detection lead time and net financial impact"
+
+    def evaluate(self, sweep_results: list[SimulationResults]) -> HypothesisResult:
+        lead_times = []
+        impacts = []
+        for r in sweep_results:
+            for incident in r.incidents:
+                if incident.detected and incident.detection_lead_time_hours > 0:
+                    lead_times.append(incident.detection_lead_time_hours)
+                    impacts.append(incident.net_financial_impact)
+
+        if len(lead_times) < 10:
+            return HypothesisResult(
+                hypothesis_id=self.hypothesis_id, title=self.title,
+                verdict=HypothesisVerdict.INCONCLUSIVE,
+                primary_metric="Pearson correlation: detection lead time vs net financial impact",
+                primary_value=0.0,
+                key_finding="Insufficient detected incidents to evaluate actionability gap.",
+                falsification_condition=self.falsification_condition,
+            )
+
+        corr, p_value = stats.pearsonr(lead_times, impacts)
+        strong_negative = corr < -0.5 and p_value < 0.05
+
+        # Quantify the magnitude: compare mean impact at top vs bottom quartile of lead time
+        lead_arr = np.array(lead_times)
+        impact_arr = np.array(impacts)
+        q25 = float(np.percentile(lead_arr, 25))
+        q75 = float(np.percentile(lead_arr, 75))
+        early_detection_impact = float(np.mean(impact_arr[lead_arr <= q25]))
+        late_detection_impact = float(np.mean(impact_arr[lead_arr >= q75]))
+        impact_reduction_pct = (late_detection_impact - early_detection_impact) / max(1, late_detection_impact)
+
+        if strong_negative:
+            verdict = HypothesisVerdict.SUPPORTED
+            finding = (
+                f"Detection lead time negatively correlates with financial impact (r={corr:.3f}, p={p_value:.4f}). "
+                f"Early detection (bottom quartile) produces {impact_reduction_pct:.0%} lower impact than late detection. "
+                f"Visibility and actionability are separable problems — deprioritizing visibility because response maturity "
+                f"is low is a category error: the value of early detection exists independent of response speed."
+            )
+        elif corr < -0.3 and p_value < 0.05:
+            verdict = HypothesisVerdict.INCONCLUSIVE
+            finding = (
+                f"Moderate negative correlation (r={corr:.3f}, p={p_value:.4f}). "
+                f"Some evidence that earlier detection reduces impact, but effect size below threshold."
+            )
+        else:
+            verdict = HypothesisVerdict.FAILED
+            finding = (
+                f"Weak or non-significant correlation (r={corr:.3f}, p={p_value:.4f}). "
+                f"Detection lead time does not materially reduce financial impact in this model."
+            )
+
+        return HypothesisResult(
+            hypothesis_id=self.hypothesis_id, title=self.title, verdict=verdict,
+            primary_metric="Pearson correlation: detection lead time vs net financial impact",
+            primary_value=float(corr), key_finding=finding,
+            supporting_metrics={
+                "pearson_r": float(corr), "p_value": float(p_value),
+                "n_detected_incidents": len(lead_times),
+                "early_detection_mean_impact": early_detection_impact,
+                "late_detection_mean_impact": late_detection_impact,
+                "impact_reduction_early_vs_late": impact_reduction_pct,
+            },
+            falsification_condition=self.falsification_condition,
+            falsification_met=not strong_negative,
+            p_value=float(p_value), effect_size=float(corr),
+        )
+
+
+class H6SegmentationQualityHypothesis(BaseHypothesis):
+    hypothesis_id = "H6"
+    title = "Segmentation built on incomplete inventory leaves blind attack paths to crown jewels"
+    falsification_condition = "Blind segmentation gap count does not decrease significantly as inventory completeness increases"
+
+    def evaluate(self, sweep_results: list[SimulationResults], graph: MeridianGraph) -> HypothesisResult:
+        completeness_levels = [r.inventory_completeness for r in sweep_results]
+        blind_gap_counts = []
+
+        crown_jewels = graph.get_crown_jewels()
+        entry_points = list({
+            n for n, d in graph.graph.nodes(data=True)
+            if d.get("purdue_level", 0) >= 4
+        })[:20]  # cap to keep runtime reasonable
+
+        for level in completeness_levels:
+            # Build a fresh graph at this completeness level to get correct inventoried flags
+            from src.assets.graph import MeridianGraph as MG
+            level_graph = MG(inventory_completeness=level, seed=graph.seed).build()
+            uninventoried = set(level_graph.get_uninventoried_nodes())
+            # Use undirected graph — graph edges are directional (OT→IT) but attackers
+            # traverse bidirectionally; segmentation gaps must account for both directions.
+            undirected = level_graph.graph.to_undirected()
+
+            blind_paths = 0
+            for entry in entry_points:
+                if entry not in undirected:
+                    continue
+                for crown in crown_jewels:
+                    if crown not in undirected:
+                        continue
+                    try:
+                        paths = list(nx.all_simple_paths(
+                            undirected, entry, crown, cutoff=4
+                        ))
+                        blind_paths += sum(
+                            1 for p in paths
+                            if any(node in uninventoried for node in p[1:-1])
+                        )
+                    except (nx.NetworkXError, nx.NodeNotFound):
+                        continue
+
+            blind_gap_counts.append(blind_paths)
+
+        # H6 is SUPPORTED if blind gap count drops significantly as completeness increases
+        corr, p_value = stats.pearsonr(completeness_levels, blind_gap_counts) if len(completeness_levels) >= 3 else (0.0, 1.0)
+        drop_from_baseline = blind_gap_counts[0] - blind_gap_counts[-1] if blind_gap_counts else 0
+        significant_drop = corr < -0.5 and p_value < 0.05 and drop_from_baseline > 0
+
+        baseline_gaps = blind_gap_counts[0] if blind_gap_counts else 0
+        full_inv_gaps = blind_gap_counts[-1] if blind_gap_counts else 0
+        pct_reduction = (baseline_gaps - full_inv_gaps) / max(1, baseline_gaps)
+
+        if significant_drop:
+            verdict = HypothesisVerdict.SUPPORTED
+            finding = (
+                f"Blind segmentation gaps drop from {baseline_gaps} paths at "
+                f"{completeness_levels[0]:.0%} inventory to {full_inv_gaps} at "
+                f"{completeness_levels[-1]:.0%} — a {pct_reduction:.0%} reduction (r={corr:.3f}, p={p_value:.4f}). "
+                f"Segmentation designers cannot block paths they cannot see. "
+                f"At Meridian's 40% inventory coverage, a material fraction of crown jewel attack paths "
+                f"traverse assets that were never considered in segmentation design."
+            )
+        elif drop_from_baseline > 0:
+            verdict = HypothesisVerdict.INCONCLUSIVE
+            finding = (
+                f"Some reduction in blind paths ({baseline_gaps} → {full_inv_gaps}) but correlation "
+                f"below threshold (r={corr:.3f}, p={p_value:.4f})."
+            )
+        else:
+            verdict = HypothesisVerdict.FAILED
+            finding = (
+                f"No significant reduction in blind segmentation paths as completeness increases "
+                f"(r={corr:.3f}). Segmentation may be effective despite partial inventory."
+            )
+
+        return HypothesisResult(
+            hypothesis_id=self.hypothesis_id, title=self.title, verdict=verdict,
+            primary_metric="Blind crown-jewel attack paths (traverse uninventoried nodes)",
+            primary_value=float(baseline_gaps), key_finding=finding,
+            supporting_metrics={
+                "completeness_levels": completeness_levels,
+                "blind_gap_counts": blind_gap_counts,
+                "correlation_completeness_vs_gaps": float(corr),
+                "p_value": float(p_value),
+                "baseline_blind_gaps": baseline_gaps,
+                "full_inventory_blind_gaps": full_inv_gaps,
+                "pct_reduction": pct_reduction,
+            },
+            falsification_condition=self.falsification_condition,
+            falsification_met=not significant_drop,
+            p_value=float(p_value),
+        )
+
+
+class H8RiskQuantificationHypothesis(BaseHypothesis):
+    hypothesis_id = "H8"
+    title = "FAIR-style risk outputs are unreliable at partial inventory — partial coverage systematically understates risk"
+    falsification_condition = "Coefficient of variation of net financial impact is equivalent across completeness levels"
+
+    def evaluate(self, sweep_results: list[SimulationResults]) -> HypothesisResult:
+        completeness_levels = [r.inventory_completeness for r in sweep_results]
+        cv_by_level = []
+        mean_by_level = []
+
+        for r in sweep_results:
+            impacts = [i.net_financial_impact for i in r.incidents]
+            mean_impact = float(np.mean(impacts))
+            std_impact = float(np.std(impacts))
+            cv = std_impact / mean_impact if mean_impact > 0 else 0.0
+            cv_by_level.append(cv)
+            mean_by_level.append(mean_impact)
+
+        # Systematic understatement: mean impact at each level vs mean impact at 100%
+        full_inventory_mean = mean_by_level[-1] if mean_by_level else 0.0
+        understatement_by_level = [
+            (full_inventory_mean - m) / max(1, full_inventory_mean)
+            for m in mean_by_level
+        ]
+
+        # H8 SUPPORTED if CV is materially higher at low completeness
+        low_cv = cv_by_level[0] if cv_by_level else 0.0
+        high_cv = cv_by_level[-1] if cv_by_level else 0.0
+        cv_corr, cv_p = stats.pearsonr(completeness_levels, cv_by_level) if len(cv_by_level) >= 3 else (0.0, 1.0)
+        cv_materially_higher = low_cv > high_cv * 1.10 and cv_corr < -0.3
+
+        baseline_understatement = understatement_by_level[
+            next((i for i, lvl in enumerate(completeness_levels) if abs(lvl - 0.40) < 0.05), 0)
+        ]
+
+        if cv_materially_higher:
+            verdict = HypothesisVerdict.SUPPORTED
+            finding = (
+                f"Risk estimates are materially less reliable at low inventory coverage: "
+                f"CV={low_cv:.2f} at {completeness_levels[0]:.0%} vs CV={high_cv:.2f} at {completeness_levels[-1]:.0%}. "
+                f"At Meridian's 40% baseline, FAIR models understate expected loss by ~{baseline_understatement:.0%} "
+                f"relative to full-inventory estimates. Decision-makers are receiving systematically low risk numbers."
+            )
+        elif low_cv > high_cv:
+            verdict = HypothesisVerdict.INCONCLUSIVE
+            finding = (
+                f"CV higher at low completeness (CV={low_cv:.2f} vs {high_cv:.2f}) "
+                f"but difference below materiality threshold."
+            )
+        else:
+            verdict = HypothesisVerdict.FAILED
+            finding = (
+                f"CV does not increase at low completeness levels (CV={low_cv:.2f} low vs "
+                f"{high_cv:.2f} high). Risk estimates are similarly reliable across coverage levels."
+            )
+
+        return HypothesisResult(
+            hypothesis_id=self.hypothesis_id, title=self.title, verdict=verdict,
+            primary_metric="Coefficient of variation of net financial impact at baseline (40%) inventory",
+            primary_value=float(low_cv), key_finding=finding,
+            supporting_metrics={
+                "completeness_levels": completeness_levels,
+                "cv_by_level": cv_by_level,
+                "mean_impact_by_level": mean_by_level,
+                "understatement_by_level": understatement_by_level,
+                "full_inventory_mean_impact": full_inventory_mean,
+                "cv_correlation_with_completeness": float(cv_corr),
+                "baseline_understatement_pct": baseline_understatement,
+            },
+            falsification_condition=self.falsification_condition,
+            falsification_met=not cv_materially_higher,
+            p_value=float(cv_p),
+        )
+
+
+class H9ComplianceExposureHypothesis(BaseHypothesis):
+    hypothesis_id = "H9"
+    title = "Inventory gaps translate directly to regulatory exposure — NIST CSF ID.AM controls require asset enumeration"
+    falsification_condition = "Regulatory exposure does not decrease monotonically as inventory completeness increases"
+
+    # NIST CSF 2.0 Identify / Asset Management controls requiring asset enumeration
+    NIST_AM_CONTROLS = ["ID.AM-1", "ID.AM-2", "ID.AM-3", "ID.AM-4", "ID.AM-5"]
+
+    def evaluate(self, sweep_results: list[SimulationResults]) -> HypothesisResult:
+        completeness_levels = [r.inventory_completeness for r in sweep_results]
+        mean_reg_exposure_by_level = []
+        annualized_exposure_by_level = []
+        mean_gaps_by_level = []
+
+        from src.constants import ThreatActorConfig
+        annual_frequency = float(sum(ThreatActorConfig.ANNUAL_FREQUENCY.values()))
+
+        for r in sweep_results:
+            reg_exposures = [i.regulatory_exposure for i in r.incidents]
+            gaps = [i.compliance_gaps for i in r.incidents]
+            mean_reg_exposure_by_level.append(float(np.mean(reg_exposures)))
+            mean_gaps_by_level.append(float(np.mean(gaps)))
+            # Annualize: mean exposure per incident × expected annual incident count
+            annual_exposure = float(np.mean(reg_exposures)) * annual_frequency
+            annualized_exposure_by_level.append(annual_exposure)
+
+        # Count impacted NIST CSF ID.AM controls based on average inventory gap
+        nist_impact_by_level = []
+        for level in completeness_levels:
+            inv_gap = 1.0 - level
+            # Each ID.AM control requires asset enumeration; gap determines partial/full non-compliance
+            # At 0% gap = full compliance, at 100% gap = zero controls met
+            impacted = round(inv_gap * len(self.NIST_AM_CONTROLS))
+            nist_impact_by_level.append(impacted)
+
+        # H9 SUPPORTED if exposure drops materially and monotonically
+        monotonic_drop = all(
+            annualized_exposure_by_level[i] >= annualized_exposure_by_level[i + 1]
+            for i in range(len(annualized_exposure_by_level) - 1)
+        )
+        exposure_at_baseline = annualized_exposure_by_level[
+            next((i for i, lvl in enumerate(completeness_levels) if abs(lvl - 0.40) < 0.05), 0)
+        ]
+        exposure_at_full = annualized_exposure_by_level[-1]
+        exposure_reduction = exposure_at_baseline - exposure_at_full
+        nist_at_baseline = nist_impact_by_level[
+            next((i for i, lvl in enumerate(completeness_levels) if abs(lvl - 0.40) < 0.05), 0)
+        ]
+
+        if monotonic_drop and exposure_reduction > 0:
+            verdict = HypothesisVerdict.SUPPORTED
+            finding = (
+                f"Annualized regulatory exposure drops monotonically from ${exposure_at_baseline:,.0f} "
+                f"at 40% inventory to ${exposure_at_full:,.0f} at full coverage — "
+                f"a ${exposure_reduction:,.0f} reduction. "
+                f"At Meridian's baseline, {nist_at_baseline}/{len(self.NIST_AM_CONTROLS)} NIST CSF 2.0 "
+                f"Identify controls (ID.AM-1 through ID.AM-5) are partially or wholly unmet because "
+                f"all five require asset enumeration."
+            )
+        elif exposure_reduction > 0:
+            verdict = HypothesisVerdict.INCONCLUSIVE
+            finding = (
+                f"Exposure decreases overall (${exposure_at_baseline:,.0f} → ${exposure_at_full:,.0f}) "
+                f"but not monotonically. Non-monotonic pattern may reflect simulation noise."
+            )
+        else:
+            verdict = HypothesisVerdict.FAILED
+            finding = (
+                f"Regulatory exposure does not decrease with higher inventory completeness. "
+                f"Compliance exposure may be driven by incident frequency rather than inventory coverage."
+            )
+
+        return HypothesisResult(
+            hypothesis_id=self.hypothesis_id, title=self.title, verdict=verdict,
+            primary_metric="Mean annualized regulatory exposure at baseline (40%) inventory",
+            primary_value=float(exposure_at_baseline), key_finding=finding,
+            supporting_metrics={
+                "completeness_levels": completeness_levels,
+                "mean_regulatory_exposure_by_level": mean_reg_exposure_by_level,
+                "annualized_regulatory_exposure_by_level": annualized_exposure_by_level,
+                "mean_compliance_gaps_by_level": mean_gaps_by_level,
+                "nist_am_controls_impacted_by_level": nist_impact_by_level,
+                "nist_am_controls": self.NIST_AM_CONTROLS,
+                "exposure_reduction_baseline_to_full": exposure_reduction,
+                "monotonic_drop": monotonic_drop,
+            },
+            falsification_condition=self.falsification_condition,
+            falsification_met=not (monotonic_drop and exposure_reduction > 0),
         )

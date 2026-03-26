@@ -80,11 +80,12 @@ class SimulationResults:
         return float(np.mean([i.response_accuracy for i in self.incidents]))
 
     def total_expected_annual_loss(self) -> float:
+        """Expected annual loss: mean impact per incident × expected annual incident frequency."""
         if not self.incidents:
             return 0.0
-        return float(np.sum([i.net_financial_impact for i in self.incidents]) / (
-            self.iterations / SimConfig.DEFAULT_ITERATIONS
-        ))
+        from src.constants import ThreatActorConfig
+        annual_frequency = float(sum(ThreatActorConfig.ANNUAL_FREQUENCY.values()))
+        return float(np.mean([i.net_financial_impact for i in self.incidents]) * annual_frequency)
 
 
 class SimulationEngine:
@@ -157,9 +158,9 @@ class SimulationEngine:
         used_unknown = self._attack_used_unknown_path(entry_node, attacker_br)
         bypassed_it = ThreatActorConfig.BYPASSES_IT[actor]
 
-        downtime, direct_loss, resp_cost, reg_exp, ins_rec, net_impact = \
-            self._compute_financial_impact(actor, detected, mttd, mttr, response_accuracy)
         compliance_gaps = self._compute_compliance_gaps()
+        downtime, direct_loss, resp_cost, reg_exp, ins_rec, net_impact = \
+            self._compute_financial_impact(actor, detected, mttd, mttr, response_accuracy, compliance_gaps)
 
         return IncidentResult(
             iteration=iteration,
@@ -214,7 +215,12 @@ class SimulationEngine:
         }
         mttd = base_mttd * strategy_mttd_multiplier[self.control_strategy]
         mttd *= float(self.rng.lognormal(0, 0.3))
-        detection_lead_time = max(0.0, (mttd * 2.1) - mttd) if detected else 0.0
+        # Lead time = advance warning before maximum damage: how far ahead of worst-case
+        # the attack was detected. Early detection (low mttd) → large positive lead time.
+        if detected:
+            detection_lead_time = max(0.0, Meridian.AVG_DOWNTIME_PER_MAJOR_INCIDENT - mttd)
+        else:
+            detection_lead_time = 0.0
         return detected, mttd, detection_lead_time
 
     def _compute_response(self, detected: bool) -> tuple[float, float, float]:
@@ -229,7 +235,8 @@ class SimulationEngine:
         return response_accuracy, mttr, discovery_hours
 
     def _compute_financial_impact(
-        self, actor: ThreatActor, detected: bool, mttd: float, mttr: float, response_accuracy: float
+        self, actor: ThreatActor, detected: bool, mttd: float, mttr: float,
+        response_accuracy: float, compliance_gaps: int,
     ) -> tuple[float, float, float, float, float, float]:
         impact_mult = ThreatActorConfig.IMPACT_MULTIPLIER[actor]
         if not detected:
@@ -244,7 +251,6 @@ class SimulationEngine:
             )
         direct_loss = downtime * Meridian.REVENUE_PER_HOUR
         response_cost = mttr * Meridian.IR_FULLY_LOADED_RATE
-        compliance_gaps = self._compute_compliance_gaps()
         if compliance_gaps > 0:
             reg_exp = float(
                 self.rng.uniform(Meridian.REGULATORY_EXPOSURE_MIN, Meridian.REGULATORY_EXPOSURE_MAX)
